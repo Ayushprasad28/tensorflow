@@ -737,6 +737,144 @@ class LSTMCell(recurrent.LSTMCell):
         recurrent_dropout=recurrent_dropout,
         implementation=implementation,
         **kwargs)
+class IndyLSTMCell(rnn_cell_impl.LayerRNNCell):
+  r"""Basic IndyLSTM recurrent network cell.
+
+  Based on IndRNNs (https://arxiv.org/abs/1803.04831) and similar to
+  BasicLSTMCell, yet with the \\(U_f\\), \\(U_i\\), \\(U_o\\) and \\(U_c\\)
+  matrices in the regular LSTM equations replaced by diagonal matrices, i.e. a
+  Hadamard product with a single vector:
+
+    $$f_t = \sigma_g\left(W_f x_t + u_f \circ h_{t-1} + b_f\right)$$
+    $$i_t = \sigma_g\left(W_i x_t + u_i \circ h_{t-1} + b_i\right)$$
+    $$o_t = \sigma_g\left(W_o x_t + u_o \circ h_{t-1} + b_o\right)$$
+    $$c_t = f_t \circ c_{t-1} +
+            i_t \circ \sigma_c\left(W_c x_t + u_c \circ h_{t-1} + b_c\right)$$
+
+  where \\(\circ\\) denotes the Hadamard operator. This means that each IndyLSTM
+  node sees only its own state \\(h\\) and \\(c\\), as opposed to seeing all
+  states in the same layer.
+
+  We add forget_bias (default: 1) to the biases of the forget gate in order to
+  reduce the scale of forgetting in the beginning of the training.
+
+  It does not allow cell clipping, a projection layer, and does not
+  use peep-hole connections: it is the basic baseline.
+
+  For a detailed analysis of IndyLSTMs, see https://arxiv.org/abs/1903.08023.
+  """
+
+  def __init__(self,
+               num_units,
+               forget_bias=1.0,
+               activation=None,
+               reuse=None,
+               kernel_initializer=None,
+               bias_initializer=None,
+               name=None,
+               dtype=None):
+    """Initialize the IndyLSTM cell.
+
+    Args:
+      num_units: int, The number of units in the LSTM cell.
+      forget_bias: float, The bias added to forget gates (see above).
+        Must set to `0.0` manually when restoring from CudnnLSTM-trained
+        checkpoints.
+      activation: Activation function of the inner states.  Default: `tanh`.
+      reuse: (optional) Python boolean describing whether to reuse variables
+        in an existing scope.  If not `True`, and the existing scope already has
+        the given variables, an error is raised.
+      kernel_initializer: (optional) The initializer to use for the weight
+        matrix applied to the inputs.
+      bias_initializer: (optional) The initializer to use for the bias.
+      name: String, the name of the layer. Layers with the same name will
+        share weights, but to avoid mistakes we require reuse=True in such
+        cases.
+      dtype: Default dtype of the layer (default of `None` means use the type
+        of the first input). Required when `build` is called before `call`.
+    """
+    super(IndyLSTMCell, self).__init__(_reuse=reuse, name=name, dtype=dtype)
+
+    # Inputs must be 2-dimensional.
+    self.input_spec = input_spec.InputSpec(ndim=2)
+
+    self._num_units = num_units
+    self._forget_bias = forget_bias
+    self._activation = activation or math_ops.tanh
+    self._kernel_initializer = kernel_initializer
+    self._bias_initializer = bias_initializer
+
+  @property
+  def state_size(self):
+    return rnn_cell_impl.LSTMStateTuple(self._num_units, self._num_units)
+
+  @property
+  def output_size(self):
+    return self._num_units
+
+  def build(self, inputs_shape):
+    if tensor_shape.dimension_value(inputs_shape[1]) is None:
+      raise ValueError(
+          "Expected inputs.shape[-1] to be known, saw shape: %s" % inputs_shape)
+
+    input_depth = tensor_shape.dimension_value(inputs_shape[1])
+    # pylint: disable=protected-access
+    self._kernel_w = self.add_variable(
+        "%s_w" % rnn_cell_impl._WEIGHTS_VARIABLE_NAME,
+        shape=[input_depth, 4 * self._num_units],
+        initializer=self._kernel_initializer)
+    self._kernel_u = self.add_variable(
+        "%s_u" % rnn_cell_impl._WEIGHTS_VARIABLE_NAME,
+        shape=[1, 4 * self._num_units],
+        initializer=init_ops.random_uniform_initializer(
+            minval=-1, maxval=1, dtype=self.dtype))
+    self._bias = self.add_variable(
+        rnn_cell_impl._BIAS_VARIABLE_NAME,
+        shape=[4 * self._num_units],
+        initializer=(self._bias_initializer
+                     if self._bias_initializer is not None else
+                     init_ops.zeros_initializer(dtype=self.dtype)))
+    # pylint: enable=protected-access
+
+    self.built = True
+
+  def call(self, inputs, state):
+    """Independent Long short-term memory cell (IndyLSTM).
+
+    Args:
+      inputs: `2-D` tensor with shape `[batch_size, input_size]`.
+      state: An `LSTMStateTuple` of state tensors, each shaped
+        `[batch_size, num_units]`.
+
+    Returns:
+      A pair containing the new hidden state, and the new state (a
+        `LSTMStateTuple`).
+    """
+    sigmoid = math_ops.sigmoid
+    one = constant_op.constant(1, dtype=dtypes.int32)
+    c, h = state
+
+    gate_inputs = math_ops.matmul(inputs, self._kernel_w)
+    gate_inputs += gen_array_ops.tile(h, [1, 4]) * self._kernel_u
+    gate_inputs = nn_ops.bias_add(gate_inputs, self._bias)
+
+    # i = input_gate, j = new_input, f = forget_gate, o = output_gate
+    i, j, f, o = array_ops.split(
+        value=gate_inputs, num_or_size_splits=4, axis=one)
+
+    forget_bias_tensor = constant_op.constant(self._forget_bias, dtype=f.dtype)
+    # Note that using `add` and `multiply` instead of `+` and `*` gives a
+    # performance improvement. So using those at the cost of readability.
+    add = math_ops.add
+    multiply = math_ops.multiply
+    new_c = add(
+        multiply(c, sigmoid(add(f, forget_bias_tensor))),
+        multiply(sigmoid(i), self._activation(j)))
+    new_h = multiply(self._activation(new_c), sigmoid(o))
+
+    new_state = rnn_cell_impl.LSTMStateTuple(new_c, new_h)
+    return new_h, new_state
+
 
 
 @keras_export('keras.layers.LSTM', v1=[])
